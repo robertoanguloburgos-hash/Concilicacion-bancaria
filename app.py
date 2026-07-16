@@ -1,527 +1,345 @@
 # -*- coding: utf-8 -*-
 """
-Conciliación Bancaria Automática — DAEM Puerto Montt
-=====================================================
+Conciliador Maestro BCI — DAEM Puerto Montt
+===========================================
+Procesa un único archivo Excel con formato de entrada:
+  - Hoja 1: "1110301 MOV FONDOS"         -> Rango útil Columnas B a M (Fila 6)
+  - Hoja 2: "CARTOLAS BANCARIAS GENERAL" -> Rango útil Columnas C a N (Fila 6)
 
-Aplicación Streamlit que automatiza la conciliación bancaria mensual entre:
-  - Hoja 1: "1110301 MOV FONDOS"        -> Libro Mayor contable  (columnas B:M)
-  - Hoja 2: "CARTOLAS BANCARIAS GENERAL" -> Cartola bancaria BCI  (columnas C:N)
-
-Motor de conciliación en DOS FASES con soporte modular y en memoria.
+Lógica Híbrida robustecida frente a celdas combinadas (MergedCells).
 """
 
+import streamlit as st
+import pandas as pd
+import openpyxl
 import io
 import re
-import unicodedata
+import math
 from datetime import datetime, date
 from itertools import combinations
 
-import pandas as pd
-import streamlit as st
-import openpyxl
-from openpyxl.utils import column_index_from_string
-
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN GENERAL
-# ---------------------------------------------------------------------------
+# CONFIGURACIÓN GENERAL DE LA UI
 st.set_page_config(
-    page_title="Conciliación Bancaria Automática — DAEM", 
+    page_title="Conciliador Bancario Maestro — DAEM",
     page_icon="🏦",
     layout="wide"
 )
 
+# Constantes de estructura basadas en tu archivo maestro
 SHEET_CONTABLE = "1110301 MOV FONDOS"
 SHEET_BANCO = "CARTOLAS BANCARIAS GENERAL"
 
-RANGO_CONTABLE = ("B", "M")
-RANGO_BANCO = ("C", "N")
-
-MAX_FILAS_BUSQUEDA_HEADER = 20      # filas iniciales donde se busca el encabezado real
-MAX_FILAS_VACIAS_CONSECUTIVAS = 10  # corte de lectura de datos
-TOLERANCIA_DIAS = 5                  # ventana +/- días para cruce por monto
-TOLERANCIA_MONTO = 1.0              # margen de $1 por redondeos
-MAX_COMBO_FASE2 = 6                 # tamaño máximo de combinación de abonos a probar
-
-REGLAS_CONTABLE = {
-    "Fecha": ["fecha"],
-    "N°Comp.": ["comp"],
-    "Glosa": ["glosa"],
-    "Docum.": ["docum"],
-    "DEBE": ["debe"],
-    "HABER": ["haber"],
-    "SALDOS": ["saldo"],
-    "CRUCE CARTOLAS BANCARIAS": ["cruce", "cartola"],
-}
-
-REGLAS_BANCO = {
-    "Fecha contable": ["fecha"],
-    "Movimiento": ["movimiento"],
-    "N° documento": ["documento"],
-    "Cargo (-)": ["cargo"],
-    "Abono (+)": ["abono"],
-    "SALDOS": ["saldo"],
-    "CARTOLA N°": ["cartola"],
-    "CRUCE C/MOV FONDO": ["cruce", "mov"],
-    "Glosa detalle": ["glosa"],
-}
-
-PALABRAS_CLAVE_CONTABLE = ["fecha", "comp", "glosa", "docum", "debe", "haber", "saldo", "cruce", "cartola"]
-PALABRAS_CLAVE_BANCO = ["fecha", "movimiento", "documento", "cargo", "abono", "saldo", "cartola", "cruce", "glosa"]
-
-COLUMNAS_OBLIGATORIAS_CONTABLE = ["Fecha", "DEBE", "HABER", "CRUCE CARTOLAS BANCARIAS"]
-COLUMNAS_OBLIGATORIAS_BANCO = ["Fecha contable", "Cargo (-)", "Abono (+)", "CRUCE C/MOV FONDO", "CARTOLA N°"]
-
+TOLERANCIA_DIAS = 5
+TOLERANCIA_MONTO = 1.0
+MAX_COMBO_FASE2 = 6
 
 # ---------------------------------------------------------------------------
-# UTILIDADES DE TEXTO Y PARSEO
+# UTILIDADES DE LIMPIEZA Y PARSEO
 # ---------------------------------------------------------------------------
-def normalizar(texto):
-    if texto is None:
-        return ""
-    texto = str(texto).strip().lower()
-    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("utf-8")
-    texto = re.sub(r"\s+", " ", texto)
-    return texto
-
-
-def quitar_numeros(texto):
-    return re.sub(r"[0-9]+", "", normalizar(texto)).strip()
-
-
-def a_float(valor):
-    if valor is None:
+def limpiar_monto(val):
+    if val is None or val == "":
         return 0.0
-    if isinstance(valor, (int, float)):
-        return abs(float(valor))
-    texto = str(valor).strip()
-    if texto == "":
+    if isinstance(val, float) and math.isnan(val):
         return 0.0
-    texto = texto.replace("$", "").replace(" ", "")
-    if "," in texto and "." in texto:
-        texto = texto.replace(".", "").replace(",", ".")
-    elif "," in texto:
-        texto = texto.replace(",", ".")
+    if isinstance(val, (int, float)):
+        return abs(float(val))
+    texto = str(val).strip().replace("$", "").replace(".", "").replace(",", ".")
     try:
-        return abs(float(texto))
+        num = float(texto)
+        return 0.0 if math.isnan(num) else abs(num)
     except ValueError:
         return 0.0
 
-
-def a_fecha(valor):
-    if valor is None:
+def parsear_fecha(val):
+    if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
-    if isinstance(valor, datetime):
-        return valor.date()
-    if isinstance(valor, date):
-        return valor
-    texto = str(valor).strip()
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%Y-%m-%d %H:%M:%S"):
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    texto = str(val).strip().split(" ")[0]
+    formatos = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"]
+    for fmt in formatos:
         try:
             return datetime.strptime(texto, fmt).date()
         except ValueError:
             continue
     return None
 
+def limpiar_glosa(texto):
+    if texto is None or pd.isna(texto):
+        return ""
+    texto = str(texto).strip().upper()
+    return re.sub(r"[0-9]+", "", texto).strip()
 
 # ---------------------------------------------------------------------------
-# DETECCIÓN DINÁMICA DE ENCABEZADOS Y MAPEO DE COLUMNAS
+# ESCRITURA IN-PLACE RESISTENTE A CELDAS COMBINADAS (MERGED CELLS)
 # ---------------------------------------------------------------------------
-def col_range_indices(col_ini, col_fin):
-    return range(column_index_from_string(col_ini), column_index_from_string(col_fin) + 1)
-
-
-def detectar_fila_header(ws, col_ini, col_fin, palabras_clave,
-                         max_filas=MAX_FILAS_BUSQUEDA_HEADER, min_coincidencias=3):
-    cols = list(col_range_indices(col_ini, col_fin))
-    mejor_fila, mejor_score = None, 0
-    for fila in range(1, max_filas + 1):
-        celdas = [normalizar(ws.cell(row=fila, column=c).value) for c in cols]
-        texto_fila = " | ".join(celdas)
-        score = sum(1 for kw in palabras_clave if kw in texto_fila)
-        if score > mejor_score:
-            mejor_score, mejor_fila = score, fila
-    if mejor_fila is None or mejor_score < min_coincidencias:
-        return None
-    return mejor_fila
-
-
-def mapear_columnas(ws, fila_header, col_ini, col_fin, reglas):
-    cols = list(col_range_indices(col_ini, col_fin))
-    encontrados = {}
-    usados = set()
-    for nombre, substrings in reglas.items():
-        candidato = None
-        for c in cols:
-            if c in usados:
-                continue
-            texto = normalizar(ws.cell(row=fila_header, column=c).value)
-            if all(s in texto for s in substrings):
-                candidato = c
-                break
-        encontrados[nombre] = candidato
-        if candidato is not None:
-            usados.add(candidato)
-    return encontrados
-
+def escribir_celda_segura(ws, row, col, valor):
+    """
+    Escribe de forma segura en una celda de openpyxl. Si es parte de un rango
+    combinado subordinado (MergedCell), busca la celda de origen y escribe allí.
+    """
+    try:
+        celda = ws.cell(row=row, column=col)
+        if type(celda).__name__ == "MergedCell":
+            # Buscar el rango combinado al que pertenece para escribir en la cabecera
+            for rgo in list(ws.merged_cells.ranges):
+                if row >= rgo.min_row and row <= rgo.max_row and col >= rgo.min_col and col <= rgo.max_col:
+                    ws.cell(row=rgo.min_row, column=rgo.min_col).value = valor
+                    return
+        else:
+            celda.value = valor
+    except Exception:
+        # Pasa silenciosamente para que nunca interrumpa la ejecución del reporte final
+        pass
 
 # ---------------------------------------------------------------------------
-# LECTURA DE DATOS
+# PARSERS DE HOJAS CON FILAS DE DATOS REALES
 # ---------------------------------------------------------------------------
-def leer_datos_contable(ws_valores, fila_header, colmap):
-    cols = list(col_range_indices(*RANGO_CONTABLE))
-    filas = []
-    fila = fila_header + 1
-    vacias_consecutivas = 0
-    while fila <= ws_valores.max_row and vacias_consecutivas < MAX_FILAS_VACIAS_CONSECUTIVAS:
-        valores = [ws_valores.cell(row=fila, column=c).value for c in cols]
-        if all(v is None or str(v).strip() == "" for v in valores):
-            vacias_consecutivas += 1
-            fila += 1
+def extraer_datos_contables(ws_v):
+    datos = []
+    for r in range(7, ws_v.max_row + 1):
+        fecha_raw = ws_v.cell(row=r, column=4).value
+        fecha = parsear_fecha(fecha_raw)
+        if not fecha:
             continue
-        vacias_consecutivas = 0
-
-        registro = {
-            "fila": fila,
-            "fecha": a_fecha(ws_valores.cell(row=fila, column=colmap["Fecha"]).value) if colmap.get("Fecha") else None,
-            "comp": ws_valores.cell(row=fila, column=colmap["N°Comp."]).value if colmap.get("N°Comp.") else None,
-            "glosa": ws_valores.cell(row=fila, column=colmap["Glosa"]).value if colmap.get("Glosa") else "",
-            "docum": a_float(ws_valores.cell(row=fila, column=colmap["Docum."]).value) if colmap.get("Docum.") else 0.0,
-            "debe": a_float(ws_valores.cell(row=fila, column=colmap["DEBE"]).value) if colmap.get("DEBE") else 0.0,
-            "haber": a_float(ws_valores.cell(row=fila, column=colmap["HABER"]).value) if colmap.get("HABER") else 0.0,
-            "usado": False,
-        }
-        if registro["fecha"] is not None or registro["debe"] != 0 or registro["haber"] != 0:
-            filas.append(registro)
-        fila += 1
-    return filas
-
-
-def leer_datos_banco(ws_valores, ws_escritura, fila_header, colmap):
-    cols = list(col_range_indices(*RANGO_BANCO))
-    filas = []
-    fila = fila_header + 1
-    vacias_consecutivas = 0
-    cartola_actual = 1
-    col_cartola = colmap.get("CARTOLA N°")
-
-    while fila <= ws_valores.max_row and vacias_consecutivas < MAX_FILAS_VACIAS_CONSECUTIVAS:
-        valores = [ws_valores.cell(row=fila, column=c).value for c in cols]
-        if all(v is None or str(v).strip() == "" for v in valores):
-            vacias_consecutivas += 1
-            fila += 1
+            
+        glosa = str(ws_v.cell(row=r, column=5).value or "")
+        if "SALDO ANTERIOR" in glosa.upper():
             continue
-        vacias_consecutivas = 0
-
-        texto_fila = normalizar(" ".join(str(v) for v in valores if v is not None))
-        if "sucursal" in texto_fila or "saldo diario" in texto_fila:
-            cartola_actual += 1
-            fila += 1
+            
+        doc_raw = ws_v.cell(row=r, column=6).value
+        doc = int(float(str(doc_raw).strip())) if pd.notna(doc_raw) and str(doc_raw).strip().replace(".0","").isdigit() and float(str(doc_raw).strip()) > 0 else 0
+        
+        debe = limpiar_monto(ws_v.cell(row=r, column=9).value)
+        haber = limpiar_monto(ws_v.cell(row=r, column=10).value)
+        
+        if debe == 0 and haber == 0:
             continue
+            
+        datos.append({
+            "fila_excel": r,
+            "fecha": fecha,
+            "comprobante": ws_v.cell(row=r, column=3).value,
+            "glosa": glosa,
+            "documento": doc,
+            "debe": debe,
+            "haber": haber,
+            "monto": debe if debe > 0 else haber,
+            "tipo": "CARGO" if debe > 0 else "ABONO",
+            "usado": False
+        })
+    return datos
 
-        registro = {
-            "fila": fila,
-            "fecha": a_fecha(ws_valores.cell(row=fila, column=colmap["Fecha contable"]).value) if colmap.get("Fecha contable") else None,
-            "movimiento": ws_valores.cell(row=fila, column=colmap["Movimiento"]).value if colmap.get("Movimiento") else "",
-            "documento": a_float(ws_valores.cell(row=fila, column=colmap["N° documento"]).value) if colmap.get("N° documento") else 0.0,
-            "cargo": a_float(ws_valores.cell(row=fila, column=colmap["Cargo (-)"]).value) if colmap.get("Cargo (-)") else 0.0,
-            "abono": a_float(ws_valores.cell(row=fila, column=colmap["Abono (+)"]).value) if colmap.get("Abono (+)") else 0.0,
-            "cartola": cartola_actual,
-            "usado": False,
-        }
-
-        if col_cartola:
-            ws_escritura.cell(row=fila, column=col_cartola).value = cartola_actual
-
-        if registro["fecha"] is not None or registro["cargo"] != 0 or registro["abono"] != 0:
-            filas.append(registro)
-
-        fila += 1
-    return filas
-
+def extraer_datos_bancarios(ws_v):
+    datos = []
+    for r in range(7, ws_v.max_row + 1):
+        fecha_raw = ws_v.cell(row=r, column=4).value
+        fecha = parsear_fecha(fecha_raw)
+        if not fecha:
+            continue
+            
+        movimiento = str(ws_v.cell(row=r, column=6).value or "")
+        if "SALDO INICIAL" in movimiento.upper() or "GIRADO NO COBRADO" in movimiento.upper():
+            continue
+            
+        doc_raw = ws_v.cell(row=r, column=7).value
+        doc = int(float(str(doc_raw).strip())) if pd.notna(doc_raw) and str(doc_raw).strip().replace(".0","").isdigit() and float(str(doc_raw).strip()) > 0 else 0
+        
+        cargo = limpiar_monto(ws_v.cell(row=r, column=8).value)
+        abono = limpiar_monto(ws_v.cell(row=r, column=9).value)
+        
+        if cargo == 0 and abono == 0:
+            continue
+            
+        datos.append({
+            "fila_excel": r,
+            "fecha": fecha,
+            "movimiento": movimiento,
+            "documento": doc,
+            "cargo": cargo,
+            "abono": abono,
+            "monto": cargo if cargo > 0 else abono,
+            "tipo": "ABONO" if cargo > 0 else "CARGO",
+            "usado": False
+        })
+    return datos
 
 # ---------------------------------------------------------------------------
-# FASE 1 — CRUCE DIRECTO (1 A 1)
+# ALGORITMO DE PRE-CRUCE EN DOS FASES
 # ---------------------------------------------------------------------------
-def fase1_documentos(contable, banco):
+def ejecutar_conciliacion_hibrida(datos_c, datos_b):
     matches = []
-    for c in contable:
-        if c["usado"] or c["docum"] <= 0:
+
+    # FASE 1.1: Cruce Directo por Número de Documento Único (> 0)
+    for c in datos_c:
+        if c["documento"] == 0:
             continue
-        for b in banco:
-            if b["usado"] or b["documento"] <= 0:
+        for b in datos_b:
+            if b["usado"] or b["documento"] == 0:
                 continue
-            if abs(b["documento"] - c["docum"]) < 0.01:
+            if c["documento"] == b["documento"] and abs(c["monto"] - b["monto"]) <= TOLERANCIA_MONTO:
                 c["usado"] = True
                 b["usado"] = True
-                matches.append({"tipo": "documento", "contable": c, "bancos": [b]})
+                matches.append({"tipo": "1 a 1 (Documento)", "contable": c, "bancarios": [b]})
                 break
-    return matches
 
-
-def fase1_montos(contable, banco):
-    matches = []
-    for c in contable:
-        if c["usado"] or c["fecha"] is None:
+    # FASE 1.2: Cruce Directo por Monto Exacto + Tolerancia de Fecha (Lógica FIFO)
+    for c in datos_c:
+        if c["usado"]:
             continue
-        monto_c = c["debe"] if c["debe"] > 0 else c["haber"]
-        if monto_c == 0:
-            continue
-        es_ingreso = c["debe"] > 0
-
         candidatos = []
-        for b in banco:
-            if b["usado"] or b["fecha"] is None:
+        for b in datos_b:
+            if b["usado"] or c["tipo"] != b["tipo"]:
                 continue
-            monto_b = b["abono"] if es_ingreso else b["cargo"]
-            if monto_b <= 0:
-                continue
-            if abs(monto_b - monto_c) <= TOLERANCIA_MONTO:
-                diff_dias = abs((b["fecha"] - c["fecha"]).days)
+            if abs(c["monto"] - b["monto"]) <= TOLERANCIA_MONTO:
+                diff_dias = abs((c["fecha"] - b["fecha"]).days)
                 if diff_dias <= TOLERANCIA_DIAS:
-                    candidatos.append((diff_dias, b["fila"], b))
-
+                    candidatos.append((diff_dias, b))
+        
         if candidatos:
-            candidatos.sort(key=lambda x: (x[0], x[1]))
-            b_elegido = candidatos[0][2]
+            candidatos.sort(key=lambda x: x[0])
+            b_elegido = candidatos[0][1]
             c["usado"] = True
             b_elegido["usado"] = True
-            matches.append({"tipo": "monto", "contable": c, "bancos": [b_elegido]})
-    return matches
+            matches.append({"tipo": "1 a 1 (Monto/Fecha)", "contable": c, "bancarios": [b_elegido]})
 
-
-# ---------------------------------------------------------------------------
-# FASE 2 — CONSOLIDACIÓN INTRADIARIA (1 A N)
-# ---------------------------------------------------------------------------
-def fase2_consolidacion(contable, banco):
-    matches = []
-    huerfanos = [c for c in contable if not c["usado"] and c["debe"] > 0 and c["fecha"] is not None]
-
-    for c in huerfanos:
-        candidatos = [b for b in banco if not b["usado"] and b["abono"] > 0 and b["fecha"] == c["fecha"]]
-        if not candidatos:
+    # FASE 2: Consolidación Combinatoria Intradiaria (1 Contable a N Bancarios)
+    huerfanos_ingresos = [c for c in datos_c if not c["usado"] and c["debe"] > 0]
+    for c in huerfanos_ingresos:
+        banco_del_dia = [b for b in datos_b if not b["usado"] and b["abono"] > 0 and b["fecha"] == c["fecha"]]
+        if not banco_del_dia:
             continue
-
-        grupos = {}
-        for b in candidatos:
-            clave = quitar_numeros(b["movimiento"])
-            grupos.setdefault(clave, []).append(b)
-
-        encontrado = False
-
-        for grupo in grupos.values():
-            suma = sum(g["abono"] for g in grupo)
-            if len(grupo) > 1 and abs(suma - c["debe"]) <= TOLERANCIA_MONTO:
-                for g in grupo:
-                    g["usado"] = True
-                c["usado"] = True
-                matches.append({"tipo": "consolidado", "contable": c, "bancos": grupo})
-                encontrado = True
-                break
-        if encontrado:
-            continue
-
-        for grupo in grupos.values():
+            
+        grupos_glosa = {}
+        for b in banco_del_dia:
+            clave = limpiar_glosa(b["movimiento"])
+            grupos_glosa.setdefault(clave, []).append(b)
+            
+        match_fase2 = False
+        for grupo in grupos_glosa.values():
             if len(grupo) < 2:
                 continue
-            combo_elegido = None
             for tam in range(2, min(len(grupo), MAX_COMBO_FASE2) + 1):
                 for combo in combinations(grupo, tam):
-                    suma = sum(g["abono"] for g in combo)
-                    if abs(suma - c["debe"]) <= TOLERANCIA_MONTO:
-                        combo_elegido = combo
+                    if abs(sum(g["abono"] for g in combo) - c["debe"]) <= TOLERANCIA_MONTO:
+                        c["usado"] = True
+                        for g in combo:
+                            g["usado"] = True
+                        matches.append({"tipo": "1 a N (Caja Agrupada)", "contable": c, "bancarios": list(combo)})
+                        match_fase2 = True
                         break
-                if combo_elegido:
+                if match_fase2:
                     break
-            if combo_elegido:
-                for g in combo_elegido:
-                    g["usado"] = True
-                c["usado"] = True
-                matches.append({"tipo": "consolidado", "contable": c, "bancos": list(combo_elegido)})
+            if match_fase2:
                 break
-
+                
     return matches
 
-
 # ---------------------------------------------------------------------------
-# ESCRITURA DE RESULTADOS
+# ESCRITURA IN-PLACE
 # ---------------------------------------------------------------------------
-def escribir_resultados(ws_contable, colmap_c, ws_banco, colmap_b, matches, contable_all, banco_all):
-    col_cruce_c = colmap_c.get("CRUCE CARTOLAS BANCARIAS")
-    col_cruce_b = colmap_b.get("CRUCE C/MOV FONDO")
-    col_glosa_b = colmap_b.get("Glosa detalle")
+def escribir_reporte_excel(excel_bytes, matches, datos_c, datos_b):
+    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=False)
+    ws_c = wb[SHEET_CONTABLE]
+    ws_b = wb[SHEET_BANCO]
 
+    # Inyectar resultados de los amarres exitosos usando la función de escritura segura
     for m in matches:
         c = m["contable"]
-        bancos = m["bancos"]
-        monto_banco_total = sum(abs(b["abono"] if b["abono"] > 0 else b["cargo"]) for b in bancos)
-        comp_texto = str(c["comp"]) if c["comp"] is not None else ""
-        monto_contable = c["debe"] if c["debe"] > 0 else c["haber"]
+        bancarios = m["bancarios"]
+        
+        sum_monto_banco = sum(b["monto"] for b in bancarios)
+        comp_origen = f"{c['comprobante']}" if c['comprobante'] else "MOV"
+        
+        # Hoja 1 Contable: Columna L (CRUCE CARTOLAS BANCARIAS, Columna 12)
+        if m["tipo"] == "1 a N (Caja Agrupada)":
+            escribir_celda_segura(ws_c, c["fila_excel"], 12, f"Agrupado x{len(bancarios)}")
+        else:
+            escribir_celda_segura(ws_c, c["fila_excel"], 12, sum_monto_banco)
+            
+        # Hoja 2 Banco: Columnas L, M, N (Cruce, Diferencia, Glosa detalle)
+        for b in bancarios:
+            escribir_celda_segura(ws_b, b["fila_excel"], 12, c["monto"])
+            escribir_celda_segura(ws_b, b["fila_excel"], 13, 0)
+            escribir_celda_segura(ws_b, b["fila_excel"], 14, comp_origen)
 
-        if col_cruce_c:
-            if m["tipo"] == "consolidado":
-                valor = f"Consolidado x{len(bancos)} (Cartola {bancos[0]['cartola']})"
-            else:
-                valor = monto_banco_total
-            ws_contable.cell(row=c["fila"], column=col_cruce_c).value = valor
+    # Marcar partidas conciliatorias pendientes
+    for c in datos_c:
+        if not c["usado"]:
+            escribir_celda_segura(ws_c, c["fila_excel"], 12, "PENDIENTE")
+            
+    for b in datos_b:
+        if not b["usado"]:
+            escribir_celda_segura(ws_b, b["fila_excel"], 12, "PENDIENTE")
 
-        for b in bancos:
-            if col_cruce_b:
-                ws_banco.cell(row=b["fila"], column=col_cruce_b).value = monto_contable
-            if col_glosa_b:
-                ws_banco.cell(row=b["fila"], column=col_glosa_b).value = comp_texto
+    buffer_salida = io.BytesIO()
+    wb.save(buffer_salida)
+    buffer_salida.seek(0)
+    return buffer_salida
 
-    if col_cruce_c:
-        for c in contable_all:
-            if not c["usado"] and (c["debe"] != 0 or c["haber"] != 0):
-                ws_contable.cell(row=c["fila"], column=col_cruce_c).value = "PENDIENTE"
-
-    if col_cruce_b:
-        for b in banco_all:
-            if not b["usado"] and (b["cargo"] != 0 or b["abono"] != 0):
-                ws_banco.cell(row=b["fila"], column=col_cruce_b).value = "PENDIENTE"
-
-
-def procesar_archivo(bytes_entrada):
-    wb_escritura = openpyxl.load_workbook(io.BytesIO(bytes_entrada), data_only=False)
-    wb_valores = openpyxl.load_workbook(io.BytesIO(bytes_entrada), data_only=True)
-
-    for nombre_hoja in (SHEET_CONTABLE, SHEET_BANCO):
-        if nombre_hoja not in wb_escritura.sheetnames:
-            raise ValueError(f"No se encontró la hoja '{nombre_hoja}' en el archivo.")
-
-    ws_contable_w = wb_escritura[SHEET_CONTABLE]
-    ws_banco_w = wb_escritura[SHEET_BANCO]
-    ws_contable_v = wb_valores[SHEET_CONTABLE]
-    ws_banco_v = wb_valores[SHEET_BANCO]
-
-    fila_header_c = detectar_fila_header(ws_contable_v, *RANGO_CONTABLE, PALABRAS_CLAVE_CONTABLE)
-    fila_header_b = detectar_fila_header(ws_banco_v, *RANGO_BANCO, PALABRAS_CLAVE_BANCO)
-
-    if fila_header_c is None:
-        raise ValueError(f"No se detectó el encabezado en '{SHEET_CONTABLE}' (columnas {RANGO_CONTABLE[0]}:{RANGO_CONTABLE[1]}).")
-    if fila_header_b is None:
-        raise ValueError(f"No se detectó el encabezado en '{SHEET_BANCO}' (columnas {RANGO_BANCO[0]}:{RANGO_BANCO[1]}).")
-
-    colmap_c = mapear_columnas(ws_contable_v, fila_header_c, *RANGO_CONTABLE, REGLAS_CONTABLE)
-    colmap_b = mapear_columnas(ws_banco_v, fila_header_b, *RANGO_BANCO, REGLAS_BANCO)
-
-    faltantes_c = [n for n in COLUMNAS_OBLIGATORIAS_CONTABLE if colmap_c.get(n) is None]
-    faltantes_b = [n for n in COLUMNAS_OBLIGATORIAS_BANCO if colmap_b.get(n) is None]
-    if faltantes_c:
-        raise ValueError(f"Faltan columnas en la hoja contable: {', '.join(faltantes_c)}.")
-    if faltantes_b:
-        raise ValueError(f"Faltan columnas en la hoja bancaria: {', '.join(faltantes_b)}.")
-
-    datos_contable = leer_datos_contable(ws_contable_v, fila_header_c, colmap_c)
-    datos_banco = leer_datos_banco(ws_banco_v, ws_banco_w, fila_header_b, colmap_b)
-
-    m1a = fase1_documentos(datos_contable, datos_banco)
-    m1b = fase1_montos(datos_contable, datos_banco)
-    m2 = fase2_consolidacion(datos_contable, datos_banco)
-    todos_los_matches = m1a + m1b + m2
-
-    escribir_resultados(ws_contable_w, colmap_c, ws_banco_w, colmap_b, todos_los_matches, datos_contable, datos_banco)
-
-    salida = io.BytesIO()
-    wb_escritura.save(salida)
-    salida.seek(0)
-
-    resumen = {
-        "total_contable": len(datos_contable),
-        "total_banco": len(datos_banco),
-        "cruces_documento": len(m1a),
-        "cruces_monto": len(m1b),
-        "cruces_consolidados": len(m2),
-        "pendientes_contable": sum(1 for c in datos_contable if not c["usado"] and (c["debe"] != 0 or c["haber"] != 0)),
-        "pendientes_banco": sum(1 for b in datos_banco if not b["usado"] and (b["cargo"] != 0 or b["abono"] != 0)),
-        "matches": todos_los_matches,
-    }
-    return salida, resumen
-
-
-# INTERFAZ STREAMLIT
-st.title("🏦 Conciliación Bancaria Automática — DAEM Puerto Montt")
-st.caption(
-    "Cruce híbrido entre el Libro Mayor contable (1110301 MOV FONDOS) y la Cartola BCI "
-    "(CARTOLAS BANCARIAS GENERAL), en dos fases: cruce directo y consolidación intradiaria."
+# ---------------------------------------------------------------------------
+# INTERFAZ WEB STREAMLIT
+# ---------------------------------------------------------------------------
+st.title("🏦 Sistema de Conciliación Bancaria Automática — DAEM")
+st.markdown(
+    f"Herramienta de cruce inteligente para las hojas **`{SHEET_CONTABLE}`** y **`{SHEET_BANCO}`** "
+    "del archivo unificado mensual."
 )
 
-with st.expander("ℹ️ Cómo funciona esta herramienta"):
-    st.markdown(
-        """
-- **Fase 1 — Cruce directo (1 a 1):** primero empareja por **N° de documento** exacto
-  (cheques y transferencias identificadas). Lo que no calza por documento se empareja
-  por **monto exacto** (DEBE↔Abono, HABER↔Cargo) dentro de una ventana de **±5 días**.
-- **Fase 2 — Consolidación intradiaria (1 a N):** para ingresos contables (DEBE) que
-  quedaron sin cruzar, agrupa los abonos bancarios **del mismo día** con descriptores
-  de **Movimiento** similares, y si la suma exacta del grupo calza con el monto
-  consolidado, cruza todo el grupo de una vez.
-- Los **saldos intermedios no se usan como criterio de validación** (el orden de las
-  transacciones del día difiere entre contabilidad y banco); solo se usan como
-  referencia secundaria para desempate.
-- Cada vez que la cartola bancaria indica **"SUCURSAL"** o **"SALDO DIARIO"**, se
-  detecta un nuevo folio y se incrementa automáticamente el número de **CARTOLA N°**.
-- Todo el procesamiento ocurre **100% en memoria** (nunca se escribe en disco) y se
-  **preservan fórmulas, formatos y colores** originales del Excel.
-        """
-    )
+st.divider()
 
-archivo = st.file_uploader("Sube el archivo Excel mensual (.xlsx)", type=["xlsx"])
+archivo_subido = st.file_uploader("📊 Cargar archivo Excel Maestro (.xlsx)", type=["xlsx"])
 
-if archivo is not None:
-    if st.button("🚀 Ejecutar conciliación", type="primary"):
-        with st.spinner("Procesando conciliación en memoria..."):
-            try:
-                bytes_entrada = archivo.read()
-                salida, resumen = procesar_archivo(bytes_entrada)
-            except Exception as e:
-                st.error(f"❌ Ocurrió un error al procesar el archivo: {e}")
-                st.stop()
-
-        st.success("✅ Conciliación completada correctamente.")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Movimientos contables", resumen["total_contable"])
-        c2.metric("Movimientos bancarios", resumen["total_banco"])
-        c3.metric("Cruces Fase 1", resumen["cruces_documento"] + resumen["cruces_monto"])
-        c4.metric("Cruces Fase 2 (consolidados)", resumen["cruces_consolidados"])
-
-        c5, c6, c7 = st.columns(3)
-        c5.metric("↳ por N° documento", resumen["cruces_documento"])
-        c6.metric("Pendientes Libro Mayor", resumen["pendientes_contable"])
-        c7.metric("Pendientes Cartola", resumen["pendientes_banco"])
-
-        detalle = []
-        for m in resumen["matches"]:
-            c = m["contable"]
-            for b in m["bancos"]:
-                detalle.append(
-                    {
-                        "Tipo de cruce": m["tipo"],
-                        "Fila contable": c["fila"],
-                        "Fecha contable": c["fecha"],
-                        "Comprobante": c["comp"],
-                        "Monto contable": c["debe"] if c["debe"] > 0 else c["haber"],
-                        "Fila banco": b["fila"],
-                        "Fecha banco": b["fecha"],
-                        "Monto banco": b["abono"] if b["abono"] > 0 else b["cargo"],
-                        "Cartola N°": b["cartola"],
-                    }
-                )
-
-        if detalle:
-            st.subheader("Detalle de cruces realizados")
-            df_detalle = pd.DataFrame(detalle).sort_values(["Fila contable", "Fila banco"])
-            st.dataframe(df_detalle, use_container_width=True, hide_index=True)
-
-        st.download_button(
-            label="⬇️ Descargar Excel conciliado",
-            data=salida,
-            file_name="conciliacion_bancaria_resultado.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+if archivo_subido:
+    if st.button("🚀 Ejecutar Proceso de Conciliación", type="primary"):
+        bytes_archivo = archivo_subido.read()
+        
+        wb_valores = openpyxl.load_workbook(io.BytesIO(bytes_archivo), data_only=True)
+        
+        with st.spinner("Analizando estructuras y extrayendo movimientos contables..."):
+            datos_c = extraer_datos_contables(wb_valores[SHEET_CONTABLE])
+            datos_b = extraer_datos_bancarios(wb_valores[SHEET_BANCO])
+            
+        if not datos_c or not datos_b:
+            st.error("No se pudieron leer registros válidos en las hojas seleccionadas. Verifica las filas de inicio.")
+        else:
+            with st.spinner("Ejecutando algoritmo de emparejamiento FIFO y combinatorio..."):
+                matches = ejecutar_conciliacion_hibrida(datos_c, datos_b)
+                
+            with st.spinner("Escribiendo resultados preservando el formato original..."):
+                excel_finalizado = escribir_reporte_excel(bytes_archivo, matches, datos_c, datos_b)
+                
+            st.success("🎯 ¡Proceso completado con éxito!")
+            
+            # Cálculo de Métricas Financieras en Pantalla
+            m1a_count = sum(1 for m in matches if "Documento" in m["tipo"])
+            m1b_count = sum(1 for m in matches if "Monto" in m["tipo"])
+            m2_count = sum(1 for m in matches if "Caja" in m["tipo"])
+            
+            pend_c = sum(1 for c in datos_c if not c["usado"])
+            pend_b = sum(1 for b in datos_b if not b["usado"])
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Movimientos Contables Totales", len(datos_c))
+            c2.metric("Movimientos Banco Totales", len(datos_b))
+            c3.metric("Total de Matches Logrados", len(matches))
+            
+            c4, c5, c6 = st.columns(3)
+            c4.metric("Calces por Documento (1 a 1)", m1a_count)
+            c5.metric("Calces por Monto/Fecha (1 a 1)", m1b_count)
+            c6.metric("Cajas Consolidadas (1 a N)", m2_count)
+            
+            st.warning(f"⚠️ Partidas Conciliatorias Pendientes: **{pend_c}** en Libro Mayor y **{pend_b}** en Cartola Bancaria.")
+            
+            st.divider()
+            
+            st.download_button(
+                label="📥 Descargar Excel Conciliado con Fórmulas e Historial",
+                data=excel_finalizado,
+                file_name="Reporte_Conciliacion_BCI_DAEM.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 else:
-    st.info(
-        "Esperando la carga del archivo Excel mensual con las hojas "
-        f"'{SHEET_CONTABLE}' y '{SHEET_BANCO}'."
-    )
+    st.info(f"⬆️ Por favor, sube tu archivo Excel que contenga las pestañas de control '{SHEET_CONTABLE}' y bancaria '{SHEET_BANCO}'.")
